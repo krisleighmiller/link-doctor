@@ -1,0 +1,8 @@
+recursive-include src *.py
+recursive-include src/link_doctor/examples *.c *.sh *.md
+include tests/*.py
+include tests/fixtures/*/*.c
+include .github/workflows/ci.yml
+include scripts/ci-local.sh
+include scripts/verify-package.sh
+include scripts/inspect-distributions.py

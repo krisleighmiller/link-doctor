@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "link-doctor"
+dynamic = ["version"]
+description = "Diagnose deliberately restricted GNU static-archive link order failures and propose constrained repairs."
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+# Intended boundary: CPython >= 3.11 on GNU/Linux with GNU binutils ld.bfd.
+# Actually exercised: CPython 3.14.9, GNU binutils 2.46, GCC 15.2.0. See README.
+dependencies = []
+
+[project.scripts]
+link-doctor = "link_doctor.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "link_doctor.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["link_doctor*"]
+
+[tool.setuptools.package-data]
+# The public examples ship as installed assets so a clean install can run them.
+link_doctor = [
+    "examples/README.md",
+    "examples/*/*.c",
+    "examples/*/*.sh",
+    "examples/*/*.md",
+]

@@ -1,0 +1,57 @@
+# Static Link Order Doctor CI.
+#
+# The equivalent checks can also be run locally with scripts/ci-local.sh.
+# Check the Actions run for the current hosted result; local success is not
+# a substitute for hosted evidence. The suite was recorded against CPython 3.14.9, GNU binutils
+# 2.46 (ld.bfd/readelf/ar) and GCC 15.2.0 on Linux 7.0. Hosted runners ship
+# different compiler versions; this file records toolchain versions in the
+# job log rather than asserting them.
+
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Record toolchain
+        run: |
+          python --version
+          gcc --version | head -1
+          g++ --version | head -1
+          ld.bfd --version | head -1
+          readelf --version | head -1
+          ar --version | head -1
+      - name: Full regression and differential native suite
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m unittest discover -s tests -v
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Record toolchain
+        run: |
+          python --version
+          gcc --version | head -1
+          ld.bfd --version | head -1
+          readelf --version | head -1
+          ar --version | head -1
+      - name: Build wheel and sdist
+        run: |
+          python -m venv /tmp/build-venv
+          /tmp/build-venv/bin/pip install --upgrade pip build
+          /tmp/build-venv/bin/python -m build
+      - name: Clean install, CLI surface and shipped examples outside the checkout
+        run: |
+          python -m venv /tmp/clean-venv
+          scripts/verify-package.sh dist/link_doctor-*.whl /tmp/clean-venv/bin/python /tmp/package-check dist/link_doctor-*.tar.gz
+      - name: Distribution content inspection
+        run: /tmp/build-venv/bin/python scripts/inspect-distributions.py dist
