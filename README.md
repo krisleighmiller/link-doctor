@@ -1,384 +1,342 @@
-# Static Link Order Doctor
+# Link Doctor
 
-Diagnose supported GNU static-archive link-order failures, explain the missing
-extraction, and propose a constrained repair. Optional verification runs the
-linker against isolated copies without overwriting your output.
+[![PyPI](https://img.shields.io/pypi/v/link-doctor.svg)](https://pypi.org/project/link-doctor/)
+[![Python](https://img.shields.io/pypi/pyversions/link-doctor.svg)](https://pypi.org/project/link-doctor/)
+[![CI](https://github.com/krisleighmiller/link-doctor/actions/workflows/ci.yml/badge.svg)](https://github.com/krisleighmiller/link-doctor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/pypi/l/link-doctor.svg)](https://github.com/krisleighmiller/link-doctor/blob/main/LICENSE)
 
-Licensed under the [MIT License](LICENSE). The implementation, tests and examples
-are freshly authored; no private benchmark source, prompts, graders or fixtures
-are included or required.
+Link Doctor diagnoses GNU static-library link-order failures. It explains
+which archive member the linker missed, proposes a constrained repair, and can
+optionally verify the proposed command with the real linker without
+overwriting your existing output.
 
-## Installation and usage
+The classic failure it addresses: when linking static archives, GNU `ld`
+extracts an archive member only if, at the moment it visits that archive, it
+already needs a symbol the member defines. If `libleaf.a` appears before
+`libprovider.a`, but a member extracted from `libprovider.a` is what first
+needs `libleaf.a`, the link fails with undefined references that vanish when
+you reorder the archives. Link Doctor models this extraction at the
+archive-member level, reports exactly which member was missed, and proposes
+the smallest supported change that makes the command link.
 
-The Python package and CLI are named `link-doctor`. GNU/Linux and GNU binutils
-are required; see the supported command and toolchain boundaries below.
+Link Doctor supports a documented subset of GNU/Linux link commands. It is
+not a replacement linker or a general-purpose build repair tool. **A
+successful link does not prove equivalent program behavior**, particularly
+when a repair changes which symbol provider wins; provider changes are
+reported explicitly for review.
 
-Install into a virtual environment from a checkout or a built wheel:
+## Install
+
+Requires Python **3.11 or newer** and a GNU/Linux x86-64 system with `readelf`
+and `ld.bfd` in `/usr/bin`. GCC/G++ command inspection additionally requires
+the corresponding system compiler, and building the examples requires GCC and
+`ar`. There are no third-party Python runtime dependencies.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install link-doctor
+link-doctor --help
+link-doctor --version
+```
+
+The test suite runs on CPython 3.11 and 3.14. Native checks use GCC/G++ 15.2
+and GNU binutils 2.46; hosted CI records its own toolchain versions. No
+Windows, macOS or non-GNU linker compatibility is claimed.
+
+## Quickstart
+
+The package ships with ready-to-run examples. With the virtual environment
+above active, copy the basic example to a temporary directory and build it:
+
+```sh
+demo="$(mktemp -d)"
+python -c 'from pathlib import Path; import shutil, sys, link_doctor; shutil.copytree(Path(link_doctor.__file__).parent / "examples" / "01-basic-order", sys.argv[1], dirs_exist_ok=True)' "$demo"
+cd "$demo"
+sh build.sh
+
+link-doctor diagnose -- ld -e main -o app main.o libleaf.a libprovider.a
+```
+
+Here, `main.o` needs `provider()`. The member that defines it lives in
+`libprovider.a` and needs `helper()` from `libleaf.a`. The linker visits
+`libleaf.a` before it knows it needs `helper`, so the original order fails.
+Link Doctor identifies that missed extraction and proposes:
+
+```sh
+ld -e main -o app main.o libprovider.a libleaf.a
+```
+
+To check the original and proposed orders with the native linker:
+
+```sh
+link-doctor diagnose --verify -- ld -e main -o app main.o libleaf.a libprovider.a
+```
+
+Verification links isolated copies, redirects both outputs, and never runs
+the resulting program. It does not create or replace `app` in your working
+directory. Running the proposed command yourself has ordinary linker
+output-overwrite behavior.
+
+## Usage
+
+`link-doctor` has a single action, `diagnose`. Pass the link command as
+**arguments after `--`**, not as a quoted shell-command string. Your shell
+handles argument quoting; Link Doctor does not evaluate shell syntax,
+redirection, pipes or command substitution.
+
+```sh
+# A supported GCC link-only command:
+link-doctor diagnose -- gcc main.o -L./lib -lconsumer -lprovider -o app
+
+# Equivalent G++ command, with machine-readable output:
+link-doctor diagnose --json -- g++ main.o -L./lib -lconsumer -lprovider -o app
+
+# Resolve relative paths from a particular build directory:
+link-doctor diagnose --cwd "/path/to/build directory" -- gcc @link.rsp
+
+# Native verification is always explicit:
+link-doctor diagnose --verify --json -- gcc @link.rsp
+```
+
+| Option | Effect |
+|---|---|
+| `--cwd DIR` | Resolve inputs and response files from this working directory |
+| `--json` | Emit the structured, versioned report instead of human output |
+| `--verify` | Opt in to isolated native links of the original and proposed commands; never run the result |
+| `--version` | Print the version and exit |
+
+Use the command from the actual failed link step. Compile-and-link commands,
+such as `gcc main.c -o app`, are not supported. The selected tools are trusted
+system executables, not wrappers found through the caller's `PATH`.
+
+### Command support
+
+| Entry point | Supported intake | Important boundaries |
+|---|---|---|
+| `ld` / `ld.bfd` | Explicit `.o` and indexed GNU `.a` paths; exactly one separate `-e SYMBOL` and `-o PATH`; balanced archive groups | No `-L`, `-l`, response files, executable paths, wrappers or other linker options |
+| `gcc` / `g++` | Link-only objects/archives; optional `-o`; joined or separate `-L` and `-l`, including `-l:filename`; bounded top-level `@response` files | No source compilation, arbitrary driver flags, alternate linkers, sysroots or general user scripts/shared libraries |
+| Driver forwarding | `-Wl,` and `-Xlinker` for the allowlisted linker grammar | Forwarding does not make otherwise unsupported flags safe or supported |
+| Driver state | `--as-needed`, `--no-as-needed`, `--push-state`, `--pop-state`, `-Bstatic`, `-Bdynamic`, `--start-group`, `--end-group` | States/groups must balance; restore dynamic mode before the compiler runtime |
+
+Paths containing spaces and GNU long archive-member names are supported.
+Existing groups are evaluated to a fixed point and kept intact. Direct-linker
+and compiler-driver intake have different boundaries; support in one does not
+imply support in the other.
+
+### Response files and library lookup
+
+On the GCC/G++ path, GNU-style response expansion handles quotes, backslash
+escapes and nested files relative to the command's working directory. Cycles,
+malformed quoting, empty arguments and control characters are rejected.
+`-Wl,@file` is not supported; use top-level `@file` instead. Repairs are
+expanded argument lists, not edits to your response files. Reports retain
+original and normalized commands and response-file hashes.
+
+Library selection searches explicit `-L` directories before discovered driver
+paths, in order. Within a directory, `.so` precedes `.a` unless static mode is
+active. An unsupported selected `.so` is rejected, not skipped in favor of a
+convenient archive. Missing library names are reported explicitly.
+
+### Reading the result
+
+| Status | Meaning |
+|---|---|
+| `candidate` | A proposed command satisfies the supported model. Check native verification separately. |
+| `already_satisfied` | The original command satisfies the supported model; no repair is needed. |
+| `unknown` | No acceptable candidate was established within the constraints/budget, or native verification disagreed. This is **not** proof that no repair exists. |
+| `unsupported` | The command or an input requires semantics outside the documented boundary. |
+| `execution_failure` | An inspection/verification tool, file operation or timeout failed. |
+
+Exit **0** means `candidate` or `already_satisfied`. Exit **2** covers other
+outcomes and usage errors. Without `--verify`, the supplied link command is
+never executed, so exit 0 alone does not mean a native link succeeded.
+
+Human output and `--json` report the outcome, unresolved-symbol consumers,
+missed providers, archive visits, proposed edits and verification status.
+JSON uses `schema_version: 1`; it also provides inspected inputs/member
+facts, search budget, selected providers and native command receipts. Driver
+reports include runtime discovery and selected-file inventory.
+
+`verified` and `verification.status` describe optional native snapshot
+linking. Native disagreement withholds the usable command and returns
+`unknown`; tool failures remain `execution_failure`. Verification checks that
+the proposed command links, not that the resulting program is equivalent to
+the original.
+
+Alternative providers appear in `ambiguity` and `selected_providers`. Repairs
+that change a selected provider expose `provider_changes` and a human warning.
+Review those changes before using the proposed command.
+
+## How repairs are chosen
+
+Link Doctor models extraction at the **archive-member level**, rather than
+flattening each archive into one symbol set. Unused members do not inject
+their references. Each visited archive extracts needed members until stable;
+a later reference does not automatically rescan an earlier ordinary archive.
+Explicit `-e` seeds entry-symbol demand on the supported GNU linker.
+
+The deterministic repair preference is:
+
+1. Reorder archives within an eligible contiguous archive span.
+2. Add demand-directed repeats, up to four extra archive occurrences.
+3. Add a targeted group around a contiguous subspan, trying smaller groups
+   first.
+
+Objects, options, existing groups and implicit runtime inputs remain fixed.
+The tool preserves original archive occurrences; it does not silently remove
+inputs, add `--whole-archive`, substitute a selected library or move an object
+to make a command pass.
+
+All strategies share a **720-model-evaluation budget**, including the original.
+The search is intentionally incomplete: permutations can consume the budget
+before repeats or groups are tried, and there is no claim of global optimality
+or impossibility when the search is exhausted.
+
+Ordinary static weak/common/strong definitions are supported. Weak undefined
+references do not trigger extraction, and a resolved weak definition does not
+demand a stronger archive provider. Common definitions coalesce. Common demand
+can extract a strong defined OBJECT or NOTYPE symbol regardless of section, but
+not a weak, FUNC or common archive definition. ABS remains unsupported. Loaded
+strong/strong conflicts invalidate a candidate; unextracted alternatives do
+not.
+
+## Safety
+
+- **Diagnosis is non-linking.** It performs controlled inspection, not
+  execution of the supplied command. Driver discovery uses fixed synthetic
+  arguments in a disposable directory and a sanitized environment, not the
+  user's argv.
+- **Verification is opt-in.** Original and candidate links use byte snapshots
+  in a temporary directory. All supported output destinations are replaced,
+  including output paths that alias an input. Unsupported output-producing
+  options are rejected.
+- **No generated program is run.** Temporary link outputs are removed
+  afterward; receipt paths identify disposed snapshots, not reusable
+  executables.
+- **Input selection matters.** Inspected paths, hashes and lookup context are
+  recorded. Native verification uses the selected snapshots, not substitute
+  libraries. Later user edits to input files invalidate that snapshot
+  evidence.
+- **No shell evaluation.** Subprocesses use argv and trusted native tools.
+  Arbitrary plugins, specs, wrappers and script options are not executed.
+
+This is **not an OS sandbox**. Native parser vulnerabilities, hard disk
+quotas and a whole-process execution deadline are not solved by using
+temporary files and per-command timeouts. Do not treat arbitrary hostile
+binaries as safe.
+
+## Limits and compatibility
+
+The supported object/archive format is ordinary little-endian x86-64 ELF64
+relocatables in normal indexed GNU archives. Every member is inspected, even
+if unused. Duplicate member names, thin archives, BSD/64-bit indexes, non-ELF
+members and `__.LIBDEP` metadata are rejected. Archive indexes must match
+inspected symbols/member offsets and use nondecreasing member offsets;
+noncanonical index ordering can alter provider selection and is refused.
+Repeated archive paths share member identity; repeated explicit objects are
+rejected rather than silently deduplicated.
+
+ELF facts come from `readelf`, without debug dumps or debug-link following.
+A bounded GNU archive-container reader checks structure, members and indexes;
+it does not extract original names as filesystem destinations. `nm` and BFD
+`ar` are not used for inspection because of implicit plugin loading.
+
+The model is about symbol extraction, not relocation, layout or ABI
+validation. LTO/bitcode, general COMDAT/section-group handling, garbage
+collection, user TLS/IFUNC, arbitrary shared-library/dynamic-binding repairs
+and general linker scripts are outside scope. Direct ld supports simple
+C-style global names; the compiler-driver path handles its separately
+validated symbol/runtime grammar. Static executables and non-PIE driver
+variants are not currently supported.
+
+### Compiler runtime handling
+
+GCC/G++ startup files, search paths and fixed linker flags are discovered
+from the installed toolchain, not hard-coded. Unknown compiler templates are
+rejected. The driver-owned LTO plugin path is validated but its discovery
+options are removed; verification runs trusted `ld.bfd`, not plugins,
+`collect2` or the compiler.
+
+Restricted root-owned runtime scripts using `GROUP`, `INPUT`, `AS_NEEDED` and
+`OUTPUT_FORMAT(elf64-x86-64)` are resolved recursively with their semantics
+preserved. Explicit `-lm`, `-lc`, `-lgcc`, `-lgcc_s` and `-lstdc++` can use
+this path. A system script's child does **not** inherit trust: user-directory
+files receive ordinary user-input checks.
+
+Raw relative script filenames try the original command cwd, then library
+search paths, not the script's parent directory. Nested `-l` lookups use
+search paths without implicitly adding cwd. A selected invalid local file is
+rejected rather than replaced by a system copy. Valid archives are inspected
+as archives even if selected under a `.so` filename.
+
+Runtime DSOs' `DT_NEEDED` closure is inspected and snapshotted. RPATH/RUNPATH,
+filter and audit semantics are rejected. Necessary CRT weak references,
+versioned provider names and runtime IFUNC/TLS/unique provider presence are
+accounted for, but dynamic binding is not modeled and IFUNC resolvers are
+never executed. The runtime remains a fixed baseline, not general user-DSO
+repair support.
+
+### Resource bounds
+
+| Boundary | Direct ld | GCC/G++ |
+|---|---|---|
+| Inputs | 64 explicit inputs | 2,048 selected files |
+| Input bytes | 16 MiB total | 16 MiB per file, 128 MiB total |
+| Members per archive | 256 | 256 user / 1,024 trusted runtime |
+| Argument length | 8,192 characters | 8,192 characters |
+| Model evaluations | 720 | 720 |
+| Native invocation timeout | 10 seconds | 10 seconds |
+
+Driver response files additionally allow eight nesting levels, 64 KiB
+cumulative contents and 256 expanded arguments. Runtime-script expressions
+are limited to 16 nesting levels. Native output-size checks happen after
+invocation, not as a hard disk quota. Errors and incomplete parsing fail
+closed.
+
+## Examples
+
+Five examples ship in the installed `link_doctor/examples` directory and are
+also available in [the source tree](https://github.com/krisleighmiller/link-doctor/tree/main/src/link_doctor/examples):
+
+| Example | Demonstrates |
+|---|---|
+| `01-basic-order` | A missed extraction fixed by reordering |
+| `02-cycle` | A cross-archive dependency cycle |
+| `03-missing-provider` | A symbol with no available provider |
+| `04-ambiguity` | Alternative providers and their visible effects |
+| `05-unsupported` | An explicitly rejected command |
+
+Each contains its own sources, a `build.sh` and a README with expected
+results. Copy examples to a working directory before building them; do not
+modify an installed package in place.
+
+## Development
 
 ```sh
 git clone https://github.com/krisleighmiller/link-doctor.git
 cd link-doctor
 python3 -m venv .venv
-.venv/bin/pip install .
-# or: .venv/bin/pip install dist/link_doctor-*.whl
-.venv/bin/link-doctor --help
-.venv/bin/link-doctor --version
+. .venv/bin/activate
+python -m pip install -e .
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m unittest discover -s tests -v
+scripts/ci-local.sh
 ```
 
-### Command intake and working directory
+The test suite covers native differential cases, final-symbol/provider checks,
+input/output preservation, command normalization, and package/CLI behavior.
+`ci-local.sh` builds wheel and sdist files, checks clean installation outside
+the checkout, runs the shipped examples and inspects distribution contents;
+generated artifacts stay in the ignored `.build/` directory.
 
-```sh
-link-doctor diagnose [--verify] [--json] [--cwd DIR] -- ld -e main -o app main.o ...
-link-doctor diagnose [--verify] [--json] [--cwd DIR] -- gcc main.o -L. -lfoo -o app
-```
+Hosted [CI runs](https://github.com/krisleighmiller/link-doctor/actions/workflows/ci.yml)
+record their toolchain versions and run regression and package checks. The
+[publishing workflow](https://github.com/krisleighmiller/link-doctor/actions/workflows/publish.yml)
+is manual, defaults to a no-upload rehearsal, and requires a
+protected-environment approval for actual registry uploads through PyPI
+Trusted Publishing.
 
-Pass a linker **argv after `--`**, never a shell string; the tool performs no
-shell evaluation. Input paths in the supplied argv resolve against `--cwd`
-(or the current directory), which is also where `@response` files resolve.
-`--help` and `--version` work without a linker argv.
+## License
 
-### Result states and exit codes
-
-Exit code 0 means the report's status is `candidate` (a model-valid repair
-within the constrained search) or `already_satisfied` (the supplied order
-needed no repair). Exit code 2 covers **everything else**, including all usage
-errors and the statuses `unknown` (bounded search found no candidate — never a
-proof of impossibility), `unsupported` (outside the documented grammar) and
-`execution_failure` (missing tools/files, malformed native output or
-timeouts). Human and `--json` output carry the same status, verification state,
-reasons and provider-change warnings; JSON reports are versioned via
-`schema_version`.
-
-Verification is opt-in (`--verify`): the supplied command is never executed
-during diagnosis; verification links byte snapshots in a disposable directory,
-replaces both `-o` destinations (even output/input aliases), never runs the
-produced binary and never overwrites your inputs or existing outputs. A
-model-valid candidate is not a linker verdict, and **link success is never
-proof of program equivalence** — especially when a repair changes which member
-supplies a symbol, which the report always calls out.
-
-### Public examples
-
-Five self-contained examples ship inside the installed package:
-
-```sh
-python3 -c "from pathlib import Path; import link_doctor; print(Path(link_doctor.__file__).parent / 'examples')"
-```
-
-They cover a basic order error, a cross-archive cycle, a missing provider, a
-provider-changing ambiguity and an unsupported command. Each has a `README.md`
-and a `build.sh` that compiles with the installed GNU toolchain.
-
-### Compatibility boundary
-
-Intended: CPython >= 3.11 on GNU/Linux with GNU binutils `ld.bfd`/`readelf` at
-`/usr/bin`. Actually exercised for this build: CPython 3.14.9 and 3.14.4, GNU
-binutils 2.46, GCC/G++ 15.2.0 on Linux 7.0 (x86-64). No broader platform claim
-is made. No third-party Python dependencies; standard library only.
-
-### Regression and packaging checks
-
-The full suite (unit, native differential and CLI contract tests) runs with:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
-scripts/ci-local.sh          # build wheel+sdist, clean-install and inspect them
-```
-
-`.github/workflows/ci.yml` mirrors `scripts/ci-local.sh`. See the
-[GitHub Actions runs](https://github.com/krisleighmiller/link-doctor/actions)
-for hosted results; the recorded toolchain above describes local checks.
-Build evidence stays in `.build/` and is deliberately excluded from the
-distributions.
-
-
-## Phase 4: constrained cycles and static provider resolution
-
-Accepted after independent review and a full separate re-review. Both direct
-`ld.bfd` and ordinary GCC/G++ entry paths reuse the inspected member model and
-the same bounded repair engine.
-
-Repairs never delete or replace library inputs, or insert whole-archive.
-Preference is deterministic for the same input bytes/argv:
-
-1. Original order, then permutations within contiguous user archive spans, in
-   input occurrence order (not lexical pathname order).
-2. Starting from the original order, breadth-first demand-directed repetitions,
-   at most four added archive occurrences. Append only within the provider's
-   span, for unresolved demand introduced by a member of that same span.
-3. One contiguous subspan group, shortest width first, then left-to-right. A long
-   cyclic chain can therefore receive `--start-group A.a B.a --end-group`
-   without grouping an unrelated `C.a`.
-
-All strategies share a **720 model-evaluation budget**, including the original.
-Permutations can consume the budget before repeats/groups are tried. Repeat
-search is intentionally incomplete; it does not combine every permutation with
-every repetition, rewrite existing groups, or move inputs across barriers.
-Exhaustion is `unknown`, never proof that no repair exists. Group search starts
-from the original order and tries one new group at a time, not combinations of
-groups in multiple spans or groups plus repeats. No private formal
-memo pruning or impossibility certificates are used.
-
-Ordinary static weak/common/strong definitions are supported. Weak undefined
-references do not trigger extraction; a resolved weak definition does not demand
-a stronger archive provider. Common definitions coalesce; a common demand can
-extract a strong defined OBJECT or NOTYPE symbol, regardless of section, but not
-a weak, FUNC or common archive definition. ABS symbols remain unsupported.
-Reports list coalesced common members, not a prediction of allocated layout.
-Loaded strong/strong conflicts invalidate a candidate; unextracted alternatives
-do not. Archive/member order determines which eligible alternative is extracted.
-JSON `ambiguity`, `selected_providers`, `provider_changes` and `repair` fields,
-and human warnings expose those choices. A provider-changing repair is a visible
-proposal, **not a claim of program equivalence**, even when the link succeeds.
-
-Fresh differential tests and receipts:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
-
-`tests/test_phase4.py` writes native argv/status/trace and report receipts to
-`.build/phase4-acceptance/`. It contrasts standalone native GCC/G++/ld links
-with snapshot verification, compares archive extraction traces, tests a seeded
-24-case weak/common/strong matrix, targeted repeats/groups, alternative choices,
-conflicts, barriers and preservation. Provider winners are also checked against
-native cross-reference/common-allocation maps for direct ld and ordinary GCC/G++.
-Failure/timeout injection is explicitly
-synthetic. Red test receipts and the native common-symbol probe are retained
-there separately. No produced executable is run.
-
-## Ordinary GCC/G++ link commands
-
-```sh
-# Source checkout; paths in the supplied argv are relative to --cwd (or your cwd).
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m link_doctor \
-  diagnose --cwd '/path/to/build with spaces' --verify --json -- \
-  gcc main.o -L. -lleaf -lmiddle -o 'OUT space'
-
-# Fresh C/libc and C++/iostream reversed-order demos, actual GCC/G++ contrasts,
-# preservation hashes and human/JSON receipts in .build/phase3-acceptance/:
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 tests/phase3_acceptance.py
-```
-
-### Command-entry contract
-
-- Pass an **argv**, after `--`; the caller's shell handles its own quoting. Never
-  supply a shell command string. No shell evaluation, whitespace splitting,
-  redirection, pipes or command substitution is performed by the tool.
-- Bare `gcc` and `g++` select trusted `/usr/bin` drivers, **not** caller PATH
-  wrappers. Link-only `.o`/indexed `.a` inputs, `-o PATH`, joined/separate `-L`
-  and `-l` (including `-l:filename`) are supported. Paths may contain spaces.
-- `-Wl,` and `-Xlinker` forward only the same allowlisted linker grammar.
-  `--as-needed`, `--no-as-needed`, `--push-state`, `--pop-state`, `-Bstatic`,
-  `-Bdynamic`, `--start-group` and `--end-group` are preserved. States/groups
-  must balance; restore dynamic mode before the compiler runtime. Existing
-  groups are evaluated to a fixed point and left intact. Only contiguous user
-  archive spans outside existing groups can be reordered, repeated or grouped;
-  objects, options, runtime inputs and groups remain barriers.
-- GNU-style `@response` expansion supports quotes, backslash escapes and nested
-  files relative to the command cwd. Limits: 8 levels, 64 KiB cumulative file
-  contents, 256 expanded arguments, 8192 characters per argument. Cycles,
-  malformed quotes/escapes, empty arguments and embedded control characters
-  fail closed. `-Wl,@file` is rejected; use top-level `@file`. Repairs are fully
-  expanded canonical argv, not edits to response files. Reports preserve both
-  original and normalized commands plus response-file hashes.
-- Library selection searches all explicit `-L` directories before discovered
-  driver paths, in order; within each directory `.so` precedes `.a` unless
-  static mode is active. A selected unsupported `.so` is rejected, never
-  skipped in favor of a convenient archive. Missing library names are reported
-  explicitly. A default output name need not be supplied: verification always
-  sets its own disposable output.
-
-### Runtime discovery and safety policy
-
-The driver receives only fixed synthetic `-### DOCTOR_INPUT.o -o DOCTOR_OUTPUT`
-arguments in a disposable cwd and sanitized environment. **No supplied command
-is executed during diagnosis**, even as a driver dry run. The trusted driver's
-startup inputs, search paths and fixed linker flags are parsed, not guessed.
-Unknown template options fail closed. User specs, plugins, wrappers, source
-compilation, `-B` compiler overrides, alternate linkers, sysroots, maps,
-dependency outputs, script options and arbitrary output-producing options
-are rejected before discovery. LTO, bitcode and disguised user scripts are
-rejected during file inspection. No install or Python package dependency is needed.
-
-GCC's driver-owned `liblto_plugin.so` must resolve to a root-owned path with
-non-writable ancestors. Its discovery options are removed: **no plugin,
-collect2 or compiler is executed for verification**. Every selected object and
-archive member is checked for ELF/LTO metadata first; opt-in verification uses
-trusted `ld.bfd` on snapshots of the normalized non-LTO link.
-
-Restricted root-owned compiler-runtime `GROUP`, `INPUT`, `AS_NEEDED` and
-`OUTPUT_FORMAT(elf64-x86-64)` scripts are recursively resolved, validated and
-snapshotted. Group/as-needed semantics are preserved rather than flattened.
-Nested `-l` selections use the actual library search paths, without an implicit
-cwd entry. Raw script filenames retain their spelling: relative names (including
-nested relative paths) try the original command cwd first, then those search
-paths, not the script's parent directory; absolute names are used directly.
-A selected invalid cwd file is rejected, never replaced by a system copy.
-A system script's child does **not** inherit trust: cwd and user `-L` overrides
-receive ordinary user ELF checks, and valid archives are accepted regardless of
-a `.so` suffix. Inventory receipts retain spelling, lookup context, selected path
-and byte hash; verification renders the selected snapshots. Explicit `-lm`, `-lc`, `-lgcc`, `-lgcc_s` and `-lstdc++` may use this same
-restricted runtime path. General user scripts/shared libraries remain outside
-scope. Runtime DSOs' `DT_NEEDED` closure is inspected and snapshotted; complete
-dynamic-table row counts are checked, and RPATH/RUNPATH/filter/audit semantics
-are rejected. Verification resolves dependency aliases in the snapshot directory.
-The interpreter path is a validated system path, not an executed program.
-
-The minimum model handles CRT weak references, weak definitions, default and
-versioned shared-provider names, runtime IFUNC/TLS/unique provider *presence*,
-and initializer sections without discarding their ordinary symbol references.
-Weak undefined references do not extract archive members. It does **not** model
-runtime dynamic binding, execute IFUNC resolvers, validate relocations/layout,
-or establish behavioral equivalence. COMDAT/section groups, user TLS/IFUNC,
-user/runtime provider overlap and unsupported special sections cannot yield a
-confident repair. Trusted runtime libraries remain a fixed baseline, not general
-mixed shared/static or dynamic-binding repair support. These boundaries retain
-ordinary static object/archive repair through the compiler runtime; they do not
-claim arbitrary C++ COMDAT, section-GC or user-DSO semantics.
-
-Reports include recursive input structure, selected file hashes and trust
-classification, discovery argv/template, search paths, missing-symbol consumers,
-archive extraction evidence and positional repairs. `missing_provider`,
-`duplicate_definitions`, `provider_ambiguity` and `constrained_search_exhausted`
-are non-ordering diagnosis categories; unsupported/incompatible input and tool
-failures retain their reasons. Model-valid is not linker-verified. Native
-verification disagreement withholds the command and returns `unknown`.
-
-Limits additionally include 16 MiB per file, 128 MiB total selected files, 2048
-files, 256 members per user archive/1024 per trusted runtime archive, 16 nested
-runtime-script expressions, 720 candidate evaluations and 10 seconds per native
-call. This is **not a sandbox or a hard disk/process-wide time quota**. The
-runtime grammar is intentionally specific to the discovered GNU x86-64 toolchain;
-static executables through the driver, non-PIE driver variants, general shared
-linking and GC remain unsupported. Tested native acceptance: GCC/G++ 15.2.0
-and GNU binutils 2.46. Other templates may be explicitly rejected.
-
-## Phase 2: explicit-input diagnosis and repair
-
-The original internal vertical milestone remains supported with its narrower
-explicit-input grammar. Run from source with a CPython interpreter inside the
-declared compatibility boundary (see above), on Linux, with GNU readelf and
-ld.bfd installed at `/usr/bin`. The tests also
-require GNU gcc and ar. No Python dependencies are required.
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
-
-### Reproduce the fresh two-archive case
-
-From this directory (builds only in a disposable directory):
-
-```sh
-root="$PWD"
-build="$(mktemp -d "${TMPDIR:-/tmp}/link-doctor-demo.XXXXXX")"
-(
-  cd "$build" || exit 1
-  for name in main middle leaf; do
-    gcc -c -fno-pie -fno-stack-protector \
-      "$root/tests/fixtures/two_archives/$name.c" -o "$name.o" || exit 1
-  done
-  ar rcs libmiddle.a middle.o
-  ar rcs libleaf.a leaf.o
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$root/src" python3 -m link_doctor \
-    diagnose --verify -- ld.bfd -e main -o OUT main.o libleaf.a libmiddle.a
-)
-rm -rf -- "$build"
-```
-
-The original command leaves `leaf` unresolved: `libleaf.a(leaf.o)` was visited
-when only `middle` was needed. Later, `libmiddle.a(middle.o)` introduces the
-reference to `leaf`. The repair is:
-
-```sh
-ld.bfd -e main -o OUT main.o libmiddle.a libleaf.a
-```
-
-Add `--json` before `--` for a schema-versioned report with original argv,
-ordered inputs/members and their definitions/references, extraction events,
-archive-visit evidence, unresolved symbols/consumers, missed providers, search
-budget, positional changes, candidate model result and native verification
-receipts. Human output includes the same central evidence, proposed command,
-changes and verification status. Exit 0 means model-valid candidate or already
-satisfied; exit 2 means unsupported/error/unknown, **not** proven impossible.
-`execution_failure` distinguishes missing tools/files and timeouts from unsupported
-semantics; native rejection of a proposed repair returns `unknown` with
-`verification.status = failed` and no usable command.
-
-Without `--verify`, only inspection runs; the supplied linker command is never
-executed. With `--verify` and a model-valid candidate, both original and candidate
-orders are linked against byte snapshots in a fresh temporary directory. Both
-`-o` destinations are replaced, even when the requested output aliases an input.
-No linked binary is executed. Original files and existing output sentinels are
-untouched. Temporary files are removed on completion. Receipt argv paths therefore
-refer to now-disposed snapshots, not reusable executables. Native failure,
-timeout or disagreement with the model withholds the usable candidate command.
-A proposed command is evidence about the inspected snapshots, not a promise about
-files that a user subsequently edits; executing it manually has normal linker
-output-overwrite behavior.
-
-## Direct-ld semantics and deliberate rejection boundaries
-
-- Bare `ld` or `ld.bfd` argv only, mapped to trusted `/usr/bin/ld.bfd` rather than
-  resolved through the user's PATH. Exactly one separate `-e SYMBOL` and `-o PATH`
-  are required. Balanced `--start-group`/`--end-group` are also supported.
-  Other flags, absolute executable paths, wrappers, response files,
-  scripts, libraries by `-l`, search paths, plugin options, maps/dependency outputs,
-  whole-archive/GC modes are rejected before spawning. GCC/G++ use the separate
-  driver grammar above.
-- Explicit regular `.o` and normal indexed GNU `.a` files only; ELF64,
-  little-endian, x86-64 relocatables. Ordinary default-visibility strong, weak
-  and common globals with simple C-style names only. Unique/IFUNC/TLS, LTO/bitcode,
-  COMDAT/groups, dynamic symbols and special linker sections handled by the
-  rejection rules are unsupported. This is a symbol-extraction model, not a
-  relocation/layout/ABI validator. A model-valid command is not native success.
-- Every member is inspected, even unused members. Duplicate member names, thin
-  archives, BSD/64-bit indexes, non-ELF members and `__.LIBDEP` dependency metadata
-  are rejected. GNU long member names and path spaces are supported. Archive
-  indexes must exactly match the inspected symbol-to-member-offset relationships
-  and use nondecreasing member offsets. Noncanonical index order is explicitly
-  refused: native probes show it can change an alternative provider without
-  changing link success. Repeated archive paths share member identity; repeated
-  explicit objects are rejected, not silently deduplicated.
-- ELF facts come from `readelf -W -h -S -s`, not a new ELF parser. No debug dumps
-  or debug-link following are requested. A small bounded GNU ar **container**
-  reader preserves member order/identity, checks index consistency and rejects
-  metadata that whole-archive readelf can skip. It is not an archive extraction
-  utility: original names are never used as filesystem destinations. `nm` and
-  BFD `ar` are deliberately not run for inspection because of implicit plugins.
-- Each archive repeatedly extracts needed members until stable. Unused members
-  do not inject their references. A later reference does not rescan an earlier
-  archive. The explicit `-e` symbol roots archive extraction on the supported
-  GNU ld.bfd, as covered by a native archive-only entry-point test.
-- Only contiguous archive-only argv spans may be repaired using the Phase 4
-  policy above. Objects and every flag stay fixed and act as barriers. Search
-  never materializes factorial permutation pools. No valid candidate means
-  `unknown`, never an impossibility proof.
-- Limits: 64 inputs, 256 members per archive, 16 MiB total input bytes, 8192 chars
-  per argv token, 10 seconds per native invocation; captured tool output above
-  16 MiB is rejected after the invocation. Tools must resolve to root-owned,
-  non-group/world-writable regular files. Subprocesses use argv, `shell=False`,
-  a sanitized environment, and only the two hardcoded system tools. Missing
-  files/tools, malformed native output, stderr diagnostics and timeouts fail
-  closed. **This is not an OS sandbox**: do not treat native binutils as safe
-  against arbitrary hostile ELF exploits. Output size checks are not a hard
-  disk quota, and there is no process-wide wall-clock budget.
-
-The Phase 1 `outcomes.assess_candidate` boundary is reused: unmet requirements
-withhold a command, and model satisfaction alone never sets `verified`.
-
-## Tests
-
-`tests/test_diagnose.py` builds fresh C in temporary directories, never runs linked
-programs, and tests two/three-archive chains, correct-order contrast, intra-archive
-fixed points, unused members, object/flag barriers, missing providers/entry,
-bounded search, byte preservation including output/input aliasing, real GNU
-verification, long names/path spaces, unsupported inputs/options, metadata,
-malformed indexes, FIFO rejection, partial parser output, and injected tool
-failures/timeouts. Mocked failures are fault-injection tests, not claimed native
-link evidence. The original seven outcome/native tests remain unchanged.
-
-Canonical plan, provenance, TDD and independent verification evidence are kept
-outside this repository, in the author's private planning notes. This project
-contains only the fresh implementation, its public examples and its tests.
+[MIT](https://github.com/krisleighmiller/link-doctor/blob/main/LICENSE)
