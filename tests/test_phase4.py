@@ -206,7 +206,11 @@ class Phase4Tests(unittest.TestCase):
         self.ar('B',*['f'+str(i) for i in reversed(range(1,9,2))])
         self.obj('unused','extern int absent(void); int unused(void){return absent();}')
         self.ar('C','unused')
-        for limit,status in ((10,'unknown'),(11,'candidate')):
+        # Per-strategy budget shares (reorder: limit - limit//4 attempts,
+        # repeats: limit - limit//8) move the old 10/11 margin: the group
+        # fix still needs 6 reorder + 1 repeat + 1 group attempt, so
+        # limit 7 starves it and limit 8 reaches it.
+        for limit,status in ((7,'unknown'),(8,'candidate')):
             with patch.object(engine,'SEARCH_LIMIT',limit):
                 bounded=engine.diagnose(['ld.bfd','-e','main','-o','OUT','main.o','A.a','B.a','C.a'],cwd=self.work)
             self.receipts.append({'group_budget':limit,'report':bounded})

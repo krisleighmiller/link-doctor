@@ -225,7 +225,11 @@ class DriverTests(unittest.TestCase):
         (self.work/'args').write_text('main.o -o main.o')
         before=(self.work/'main.o').read_bytes()
         report=engine.diagnose(['gcc','@args'],verify=True,cwd=self.work)
-        self.assertTrue(report['verified'],report.get('reason'))
+        # ld refuses an output that aliases an input for any order, so the
+        # aliased command is rejected rather than reported as verified.
+        self.assertEqual(report['status'],'unsupported',report.get('reason'))
+        self.assertIn('same as input file',report.get('reason'))
+        self.assertFalse(report['verified'],report)
         self.assertEqual(before,(self.work/'main.o').read_bytes())
         (self.work/'args').write_text('x '*400)
         report=engine.diagnose(['gcc','@args'],cwd=self.work)

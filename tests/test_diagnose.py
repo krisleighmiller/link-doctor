@@ -228,11 +228,16 @@ class DiagnoseTests(unittest.TestCase):
         barrier = self.command[:6] + ["libbottom.a", "libleaf.a", "neutral.o", "libmiddle.a"]
         self.assertEqual(self.cli(barrier)["status"], "unknown")
 
-    def test_output_aliasing_input_is_redirected_not_overwritten(self):
+    def test_output_aliasing_input_is_rejected_not_overwritten(self):
+        # ld refuses "input file is the same as output file" for any order,
+        # so an aliased command is rejected instead of reported as verified.
         before = (self.work / "main.o").read_bytes()
         command = self.command.copy()
         command[4] = "main.o"
-        self.assertTrue(self.cli(command, "--verify")["verified"])
+        report = self.cli(command, "--verify")
+        self.assertEqual(report["status"], "unsupported", report)
+        self.assertIn("same as input file", report["reason"])
+        self.assertFalse(report["verified"])
         self.assertEqual((self.work / "main.o").read_bytes(), before)
 
     def test_partial_native_parse_is_rejected(self):

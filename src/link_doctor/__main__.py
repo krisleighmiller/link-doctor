@@ -1,10 +1,21 @@
 """Run with `link-doctor` or `python -m link_doctor diagnose [--verify] [--json] -- ld ...`"""
 import argparse
 import json
+import re
 import shlex
 import sys
 from . import __version__
 from .diagnose import diagnose
+
+# File-derived text (symbol names, member identities, linker stderr) can
+# carry raw terminal control bytes; text output escapes them instead of
+# emitting them raw. JSON output needs no helper: json.dumps escapes
+# control characters by design.
+_CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def safe(text):
+    return _CONTROL.sub(lambda m: "\\x%02x" % ord(m.group(0)), str(text))
 
 
 def main():
@@ -33,43 +44,43 @@ def main():
     else:
         print("Status:", report["status"])
         if "reason" in report:
-            print(report["reason"])
+            print(safe(report["reason"]))
         if report.get('diagnosis'):
             print('Diagnosis:', report['diagnosis'])
         for visit in report.get("original", {}).get("archive_visits", []):
             if visit["not_extracted"]:
                 members = visit['not_extracted']
-                detail = ', '.join(members[:8])
+                detail = ', '.join(safe(m) for m in members[:8])
                 if len(members) > 8:
                     detail += f' … ({len(members) - 8} more; full list in JSON)'
-                print(f"At {visit['archive']}: needed {', '.join(visit['needed_on_arrival']) or '(none)'}; "
+                print(f"At {safe(visit['archive'])}: needed {', '.join(safe(s) for s in visit['needed_on_arrival']) or '(none)'}; "
                       f"did not extract {detail}")
         for symbol, consumers in report.get("original", {}).get("consumers", {}).items():
-            print(f"Unresolved requirement {symbol} from {', '.join(consumers)}")
+            print(f"Unresolved requirement {safe(symbol)} from {', '.join(safe(c) for c in consumers)}")
         for item in report.get("missed", []):
-            print(f"Unresolved {item['symbol']}: consumer {item['consumer']}; missed provider {item['provider']}")
+            print(f"Unresolved {safe(item['symbol'])}: consumer {safe(item['consumer'])}; missed provider {safe(item['provider'])}")
         for item in report.get("changes", []):
-            print(f"argv[{item['argv_index']}]: {item['from']} -> {item['to']}")
+            print(f"argv[{item['argv_index']}]: {safe(item['from'])} -> {[safe(t) for t in item['to']]}")
         if report['status'] == 'already_satisfied':
             print('No repair needed: original command satisfies the supported model.')
         elif report.get('repair'):
             print('Repair strategy:', report['repair']['kind'])
         for symbol, providers in report.get('ambiguity', {}).items():
             winner = report.get('candidate', report.get('original', {})).get('selected_providers', {}).get(symbol)
-            print(f"Alternative providers for {symbol}: {', '.join(providers)}; selected: {winner}")
+            print(f"Alternative providers for {safe(symbol)}: {', '.join(safe(p) for p in providers)}; selected: {safe(winner)}")
         for change in report.get('provider_changes', []):
-            print(f"WARNING: provider changed for {change['symbol']}: {change['from']} -> {change['to']}")
+            print(f"WARNING: provider changed for {safe(change['symbol'])}: {safe(change['from'])} -> {safe(change['to'])}")
         if report.get('ambiguity') or report.get('provider_changes'):
             print('Provider choice can change behavior: link success is not program equivalence.')
         if report["command"]:
-            print("Model-validated command:", shlex.join(report["command"]))
+            print("Model-validated command:", safe(shlex.join(report["command"])))
         print("Native verification:", report["verification"]["status"])
         for label in ("original", "candidate"):
             result = report["verification"].get(label)
             if result:
                 print(f"  {label} linker exit: {result['returncode']}")
                 if result["stderr"]:
-                    print(result["stderr"].rstrip())
+                    print(safe(result["stderr"]).rstrip())
         if not report["verified"]:
             print("Not linker-verified; model satisfaction is not proof of a successful native link.")
     return 0 if report["status"] in ("candidate", "already_satisfied") else 2

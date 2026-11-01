@@ -13,7 +13,7 @@ import stat
 import subprocess
 import tempfile
 
-from .outcomes import assess_candidate
+from .outcomes import assess_candidate, withhold_candidate
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_MEMBERS = 256
@@ -59,6 +59,7 @@ class Member:
     weak_defines: frozenset[str] = frozenset()
     commons: frozenset[str] = frozenset()
     data_defines: frozenset[str] = frozenset()
+    sections: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -176,6 +177,11 @@ def archive_members(data: bytes, member_limit=MAX_MEMBERS):
         if len(members) > member_limit:
             raise Rejected("archive member limit exceeded")
     if index is None or not members:
+        if len(data) == 8:
+            # A bare end-of-header is a valid GNU archive that provides
+            # nothing (glibc 2.34+ compat stubs such as libpthread.a are
+            # exactly these eight bytes and link natively).
+            return [], b""
         raise Rejected("require a nonempty archive with GNU symbol index")
     return members, index
 
@@ -231,7 +237,8 @@ def inspect_elf(path, identity, cwd):
             # COM and WEAK were handled above and ABS remains unsupported.
             elif kind in ('OBJECT', 'NOTYPE'): data_defines.add(symbol)
     return Member(identity, frozenset(defines), frozenset(requires), frozenset(weak_requires),
-                  frozenset(weak_defines), frozenset(commons), frozenset(data_defines))
+                  frozenset(weak_defines), frozenset(commons), frozenset(data_defines),
+                  sections=frozenset(name for name, *_ in sections))
 
 
 def inspect(argv, cwd, scratch):
@@ -261,24 +268,26 @@ def inspect(argv, cwd, scratch):
                 member = inspect_elf(memberfile, f"{token}({name})", scratch)
                 members.append(member)
                 expected.update((symbol, offset) for symbol in member.defines)
-            if len(index) < 4:
-                raise Rejected("malformed archive index")
-            count = int.from_bytes(index[:4], "big")
-            if count > MAX_BYTES // 4 or 4 + count * 4 > len(index):
-                raise Rejected("malformed archive index size")
-            offsets = [int.from_bytes(index[4 + i * 4:8 + i * 4], "big") for i in range(count)]
-            if offsets != sorted(offsets):
-                raise Rejected('noncanonical archive index order unsupported')
-            raw_names = index[4 + count * 4:].split(b"\0")
-            # GNU ar may append an extra zero byte for index alignment.
-            if len(raw_names) < count + 1 or any(raw_names[count:]):
-                raise Rejected("malformed archive index names")
-            try:
-                actual = [(s.decode("ascii"), o) for s, o in zip(raw_names[:count], offsets)]
-            except UnicodeError as exc:
-                raise Rejected("unsupported archive index symbols") from exc
-            if len(set(actual)) != len(actual) or set(actual) != expected:
-                raise Rejected("archive index does not exactly match inspected definitions")
+            # An empty archive has no index to validate; it provides nothing.
+            if members:
+                if len(index) < 4:
+                    raise Rejected("malformed archive index")
+                count = int.from_bytes(index[:4], "big")
+                if count > MAX_BYTES // 4 or 4 + count * 4 > len(index):
+                    raise Rejected("malformed archive index size")
+                offsets = [int.from_bytes(index[4 + i * 4:8 + i * 4], "big") for i in range(count)]
+                if offsets != sorted(offsets):
+                    raise Rejected('noncanonical archive index order unsupported')
+                raw_names = index[4 + count * 4:].split(b"\0")
+                # GNU ar may append an extra zero byte for index alignment.
+                if len(raw_names) < count + 1 or any(raw_names[count:]):
+                    raise Rejected("malformed archive index names")
+                try:
+                    actual = [(s.decode("ascii"), o) for s, o in zip(raw_names[:count], offsets)]
+                except UnicodeError as exc:
+                    raise Rejected("unsupported archive index symbols") from exc
+                if len(set(actual)) != len(actual) or set(actual) != expected:
+                    raise Rejected("archive index does not exactly match inspected definitions")
         else:
             members = [inspect_elf(snapshot, token, scratch)]
         for member in members:
@@ -286,6 +295,12 @@ def inspect(argv, cwd, scratch):
                 providers.setdefault(symbol, []).append(member.identity)
         inputs.append(Input(token, position, snapshot, members, token.endswith(".a")))
         seen[resolved] = inputs[-1]
+    # The output path may not alias an input: ld refuses "input file is the
+    # same as output file" for any ordering, so the command can never link
+    # natively and must not be reported as satisfied.
+    resolved_output = (cwd / argv[argv.index("-o") + 1]).resolve()
+    if resolved_output in seen:
+        raise Rejected(f"output file is the same as input file: {resolved_output}")
     return inputs, entry, providers
 
 
@@ -294,7 +309,7 @@ def nodes_for(inputs, argv=None):
     by_position = {}
     for item in inputs:
         units = [Unit(m.identity, set(m.defines), set(m.requires), set(m.weak_defines),
-                      set(m.commons), set(m.data_defines)) for m in item.members]
+                      set(m.commons), set(m.data_defines), sections=set(m.sections)) for m in item.members]
         by_position[item.position] = Node(item.token, snapshot=item.snapshot, members=units,
                                           kind='archive' if item.archive else 'object', position=item.position)
     if argv is None: return list(by_position.values())
@@ -375,6 +390,9 @@ def diagnose(argv, verify=False, cwd=None):
                 report["verified"] = success and agrees
                 report["verification"]["status"] = "passed" if report["verified"] else "failed"
                 if not report["verified"]:
+                    # Withheld evidence, not instructions: edits of a candidate
+                    # the native link rejected must not stay actionable.
+                    withhold_candidate(report)
                     report.update(status="unknown", command=None,
                                   reason="Native link failed or disagreed with the supported-semantics model; candidate withheld.")
             return report

@@ -35,3 +35,18 @@ def assess_candidate(
     if command is None or unmet:
         return CandidateAssessment("unknown", None, unmet)
     return CandidateAssessment("candidate", tuple(command), ())
+
+
+def withhold_candidate(report: dict) -> None:
+    """Move actionable candidate edits under an explicit withheld key.
+
+    A candidate whose native verification failed is evidence of a rejected
+    attempt, not instructions. Leaving its argv edits reachable as ordinary
+    report fields makes text output print a usable repair the native link
+    just contradicted, so the keys move (not vanish) under
+    "withheld_candidate" for inspection.
+    """
+    withheld = {k: report.pop(k) for k in
+                ("changes", "repair", "candidate", "provider_changes") if k in report}
+    if withheld:
+        report["withheld_candidate"] = withheld

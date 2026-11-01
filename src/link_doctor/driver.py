@@ -12,9 +12,28 @@ import re
 import shlex
 import tempfile
 from . import diagnose as base
+from .outcomes import withhold_candidate
 
 MAX_TOTAL = 128 * 1024 * 1024
 MAX_FILES = 2048
+
+# Symbols the default GNU linker script assigns, PROVIDE-style, or the ELF
+# backend supplies when referenced (verified natively against ld.bfd 2.46
+# for both driver and bare-ld links): they are never archive members, so a
+# reference to one must not be reported as a missing provider. PROVIDE
+# semantics mean an explicit definition still wins in the walk; only what
+# remains unresolved at the end is provided. __start_/__stop_ section
+# bounds additionally require their named section among the linked inputs.
+LINKER_SCRIPT_SYMBOLS = frozenset({
+    '__executable_start', '__etext', '_etext', 'etext',
+    '__edata', '_edata', 'edata', '__bss_start',
+    '_end', 'end', '__ehdr_start',
+    '__preinit_array_start', '__preinit_array_end',
+    '__init_array_start', '__init_array_end',
+    '__fini_array_start', '__fini_array_end',
+    '__rela_iplt_start', '__rela_iplt_end', '__tdata_start',
+})
+SECTION_BOUND = re.compile(r'__s(?:tart|top)_([A-Za-z_][A-Za-z0-9_]*)')
 
 
 class MissingLibrary(base.Rejected):
@@ -28,6 +47,7 @@ class Unit:
     weak: set = field(default_factory=set)
     commons: set = field(default_factory=set)
     data_defines: set = field(default_factory=set)
+    sections: set = field(default_factory=set)
 
 @dataclass
 class Node:
@@ -104,22 +124,31 @@ def user_args(argv):
 
     The returned command is an argv array, never a shell program. The original
     response/wrapper spelling remains in original_command, not in the repair.
+    A forwarded -L directory must keep its -Wl,-L spelling in the canonical
+    command: the driver searches its own -L directories before any forwarded
+    one, so respelling changes native selection. Each result entry is
+    (canonical position, normalized token, forwarded) so callers can place
+    forwarded -L directories at their true native search position.
     """
-    flat=[argv[0]]; i=1
+    flat=[argv[0]]; forwarded=[False]; i=1
     while i<len(argv):
         t=argv[i]; i+=1
-        if t.startswith('-Wl,'): flat.extend(t[4:].split(','))
+        if t.startswith('-Wl,'):
+            for part in t[4:].split(','):
+                flat.append(part); forwarded.append(True)
         elif t=='-Xlinker':
             if i==len(argv): raise base.Rejected('missing -Xlinker argument')
-            flat.append(argv[i]); i+=1
-        else: flat.append(t)
+            flat.append(argv[i]); forwarded.append(True); i+=1
+        else:
+            flat.append(t); forwarded.append(False)
     if len(flat)>256 or any(not t or len(t)>8192 or any(ord(c)<32 or ord(c)==127 for c in t) for t in flat):
         raise base.Rejected('command exceeds limits, empty token or controls')
     result, canonical, output, i, states, groups = [], [flat[0]], False, 1, 0, 0
     while i<len(flat):
         t=flat[i]; i+=1
+        fwd=forwarded[i-1]
         if t in ('-L','-l','-o'):
-            if i==len(flat) or flat[i].startswith(('-', '@')): raise base.Rejected('missing option value')
+            if i==len(flat) or flat[i].startswith(('-','@')): raise base.Rejected('missing option value')
             value=flat[i]; i+=1
             if t=='-o':
                 if output: raise base.Rejected('duplicate output option')
@@ -129,12 +158,13 @@ def user_args(argv):
             states += (1 if t=='--push-state' else -1 if t=='--pop-state' else 0)
             groups += (1 if t=='--start-group' else -1 if t=='--end-group' else 0)
             if min(states,groups)<0: raise base.Rejected('unbalanced linker state/group')
-            result.append((len(canonical),t)); canonical.append('-Wl,'+t)
-        elif (t.startswith(('-L','-l')) and len(t)>2) or (not t.startswith(('-', '@')) and Path(t).suffix in ('.o','.a')):
-            result.append((len(canonical),t)); canonical.append(t)
+            result.append((len(canonical),t,fwd)); canonical.append('-Wl,'+t)
+        elif (t.startswith(('-L','-l')) and len(t)>2) or (not t.startswith(('-','@')) and Path(t).suffix in ('.o','.a')):
+            result.append((len(canonical),t,fwd))
+            canonical.append('-Wl,'+t if fwd and t.startswith('-L') else t)
         else: raise base.Rejected('unsupported driver argument: '+t)
     if states or groups: raise base.Rejected('unbalanced linker state/group')
-    if not any(not t.startswith('-') or t.startswith('-l') for _,t in result): raise base.Rejected('require link-only inputs')
+    if not any(not t.startswith('-') or t.startswith('-l') for _,t,_ in result): raise base.Rejected('require link-only inputs')
     return canonical,result
 
 
@@ -230,7 +260,11 @@ class Inventory:
                 member = self.elf(memberpath, str(path)+'('+name+')', runtime)
                 node.members.append(member)
                 expected.update((s, offset) for s in member.defines)
-            self.index(index, expected)
+            # An archive with no members and no index (eight header bytes,
+            # e.g. glibc 2.34+ -lpthread/-ldl stubs) provides nothing and is
+            # a valid input; only a present-but-wrong index is malformed.
+            if entries:
+                self.index(index, expected)
         elif data.startswith(b'\x7fELF'):
             code, header, err = base.native('readelf', ['-W', '-h', snapshot], self.scratch)
             if code or err:
@@ -343,7 +377,8 @@ class Inventory:
                 # definitions, not section writability or OBJECT alone.
                 elif binding == 'GLOBAL' and kind in ('OBJECT', 'NOTYPE'):
                     data_defines.add(symbol)
-        return Unit(identity, definitions, requirements, weak, commons, data_defines)
+        return Unit(identity, definitions, requirements, weak, commons, data_defines,
+                    sections=frozenset(name for name,*_ in sections))
 
     def script(self, text, static):
         text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
@@ -388,10 +423,12 @@ def model(nodes, entry='_start'):
     defined = {'_GLOBAL_OFFSET_TABLE_'}
     needed = {entry:['entry point']}
     extracted, trace, visits, selected = set(), [], [], {}
+    pending_commons, linked_sections = set(), set()
     duplicate = set()
     rank = {'shared':0, 'weak':1, 'common':2, 'strong':3}
     def include(unit, shared=False, reason='selected input'):
         extracted.add(unit.identity)
+        if not shared: linked_sections.update(unit.sections)
         for s in sorted(unit.defines):
             strength = 'shared' if shared else 'weak' if s in unit.weak else 'common' if s in unit.commons else 'strong'
             old = selected.get(s)
@@ -399,7 +436,15 @@ def model(nodes, entry='_start'):
                 duplicate.add(s)
             if not old or rank[strength] > rank[old['strength']]:
                 selected[s] = {'member':unit.identity,'strength':strength}
-                if strength == 'common': selected[s]['coalesced_members'] = [unit.identity]
+                if strength == 'common':
+                    selected[s]['coalesced_members'] = [unit.identity]
+                    pending_commons.add(s)
+                else:
+                    # The set of pending common symbols is maintained here,
+                    # incrementally: rescanning every selected symbol for
+                    # every archive member on every pass is quadratic in
+                    # runtime library size.
+                    pending_commons.discard(s)
             elif strength == old['strength'] == 'common':
                 old['coalesced_members'] = sorted(set([*old['coalesced_members'],unit.identity]))
         defined.update(unit.defines)
@@ -420,7 +465,7 @@ def model(nodes, entry='_start'):
                 for m in node.members:
                     # Common demand pulls strong non-function definitions
                     # (OBJECT or NOTYPE), not weak or other common symbols.
-                    common_demand = m.data_defines.intersection(s for s,p in selected.items() if p['strength']=='common')
+                    common_demand = m.data_defines & pending_commons
                     demand = m.defines.intersection(needed) | common_demand
                     if m.identity not in extracted and demand:
                         include(m, reason='requires ' + ', '.join(sorted(demand)))
@@ -433,6 +478,15 @@ def model(nodes, entry='_start'):
         else:
             if node.members[0].identity not in extracted: include(node.members[0])
     for n in nodes: visit(n)
+    for s in list(needed):
+        provided = s in LINKER_SCRIPT_SYMBOLS
+        if not provided:
+            bound = SECTION_BOUND.fullmatch(s)
+            provided = bound is not None and bound.group(1) in linked_sections
+        if provided:
+            # Default-script/orphan-section semantics: provided only when no
+            # explicit definition satisfied the reference during the walk.
+            needed.pop(s)
     return {'unresolved':sorted(needed), 'consumers':needed,'extracted':sorted(extracted),'trace':trace,'archive_visits':visits,'duplicates':sorted(duplicate), 'selected_providers':selected}
 
 
@@ -461,7 +515,13 @@ def diagnose(argv, verify=False, cwd=None):
                                    'argv':['-###','DOCTOR_INPUT.o','-o','DOCTOR_OUTPUT'],
                                    'linker_template':args,
                                    'plugin_policy':'trusted GCC liblto_plugin discovery only; never execute plugins; reject LTO/bitcode'}
-            search = [(cwd/Path(t[2:])).resolve() for _,t in positions if t.startswith('-L')] + [Path(t[2:]) for t in args if t.startswith('-L')]
+            # Native search order: direct driver -L directories come before
+            # the driver's own -L directories; forwarded -Wl,-L directories
+            # reach the linker only at their input position, after all of
+            # them. They are appended to the live search list during the
+            # walk below.
+            search = [(cwd/Path(t[2:])).resolve() for _,t,f in positions if t.startswith('-L') and not f] \
+                   + [Path(t[2:]) for t in args if t.startswith('-L')]
             inventory = Inventory(cwd,scratch,search)
             nodes, link, stack, as_needed = [], [], [], False
             i = 0
@@ -471,8 +531,13 @@ def diagnose(argv, verify=False, cwd=None):
                 if t == 'DOCTOR_INPUT.o':
                     state_stack, group_stack, static = [], [], False
                     user_objects = set()
-                    for pos, token in positions:
-                        if token.startswith('-L'): continue
+                    user_inputs = set()
+                    for pos, token, fwd in positions:
+                        if token.startswith('-L'):
+                            # A forwarded -L reaches the linker at its input
+                            # position, after every driver -L directory.
+                            if fwd: inventory.search.append((cwd/Path(token[2:])).resolve())
+                            continue
                         if token in STATE_FLAGS:
                             if token=='--push-state': state_stack.append((as_needed,static))
                             elif token=='--pop-state': as_needed,static=state_stack.pop()
@@ -493,9 +558,18 @@ def diagnose(argv, verify=False, cwd=None):
                             if n.kind=='object' and n.path in user_objects:
                                 raise base.Rejected('duplicate explicit object: ' + str(n.path))
                             if n.kind=='object': user_objects.add(n.path)
+                            user_inputs.add(n.path)
                             (group_stack[-1].children if group_stack else nodes).append(n)
                             if not group_stack: link.append(n)
                     if static: raise base.Rejected('static runtime unsupported; restore -Bdynamic')
+                    # The output path may not alias an input: ld refuses
+                    # "input file is the same as output file" for any order,
+                    # so this command can never link natively. Without -o
+                    # the driver's default a.out cannot be a supported input.
+                    if '-o' in argv:
+                        resolved_out = (cwd/Path(argv[argv.index('-o')+1])).resolve()
+                        if resolved_out in user_inputs:
+                            raise base.Rejected('output file is the same as input file: ' + str(resolved_out))
                 elif t in ('-o','-m','-dynamic-linker','-z'):
                     value = args[i]; i += 1
                     if t=='-o': value='DOCTOR_OUTPUT'
@@ -584,7 +658,11 @@ def diagnose(argv, verify=False, cwd=None):
                 ok=report['verification']['candidate']['returncode']==0 and ((report['verification']['original']['returncode']==0)==(not original['unresolved'] and not original['duplicates']))
                 report['verified']=ok
                 report['verification']['status']='passed' if ok else 'failed'
-                if not ok: report.update(status='unknown',command=None,reason='Native verification disagreed; candidate withheld.')
+                if not ok:
+                    # Withheld evidence, not instructions: edits of a candidate
+                    # the native link rejected must not stay actionable.
+                    withhold_candidate(report)
+                    report.update(status='unknown',command=None,reason='Native verification disagreed; candidate withheld.')
             return report
     except MissingLibrary as exc:
         report.update(status='unknown', diagnosis='missing_provider', command=None, reason=str(exc))
