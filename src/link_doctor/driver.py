@@ -109,7 +109,13 @@ def expand_responses(argv, cwd):
             if token.startswith('@'):
                 path=(cwd/token[1:]).resolve()
                 if path in active: raise base.Rejected('response file cycle')
-                data=base.read_bytes(path); total+=len(data)
+                try:
+                    data=base.read_bytes(path)
+                except FileNotFoundError as exc:
+                    # A missing response file is a command-intake problem,
+                    # not a tool failure.
+                    raise base.Rejected('missing response file: ' + token) from exc
+                total+=len(data)
                 if total>65536: raise base.Rejected('response byte limit')
                 records.append({'path':str(path),'sha256':hashlib.sha256(data).hexdigest()})
                 result.extend(expand(response_tokens(data.decode('utf-8')),(*active,path)))
@@ -170,8 +176,9 @@ def user_args(argv):
 
 def template(driver, scratch):
     # Fixed synthetic argv: neither user paths nor flags reach driver discovery.
-    base.TOOLS[driver] = str(trusted('/usr/bin/' + driver))
-    code, out, err = base.native(driver, ['-###', 'DOCTOR_INPUT.o', '-o', 'DOCTOR_OUTPUT'], scratch)
+    # The resolved tool is returned, not written into module state.
+    tool = str(trusted('/usr/bin/' + driver))
+    code, out, err = base.native(tool, ['-###', 'DOCTOR_INPUT.o', '-o', 'DOCTOR_OUTPUT'], scratch)
     if code:
         raise base.ExecutionFailure('compiler discovery failed: ' + err)
     commands = [shlex.split(line) for line in err.splitlines() if '/collect2 ' in line]
@@ -194,7 +201,7 @@ def template(driver, scratch):
             clean.append(t); i += 1
     if clean.count('DOCTOR_INPUT.o') != 1 or clean.count('DOCTOR_OUTPUT') != 1:
         raise base.Rejected('compiler template markers missing')
-    return clean
+    return clean, tool
 
 
 class Inventory:
@@ -423,6 +430,7 @@ def model(nodes, entry='_start'):
     defined = {'_GLOBAL_OFFSET_TABLE_'}
     needed = {entry:['entry point']}
     extracted, trace, visits, selected = set(), [], [], {}
+    seen_visits = set()
     pending_commons, linked_sections = set(), set()
     duplicate = set()
     rank = {'shared':0, 'weak':1, 'common':2, 'strong':3}
@@ -470,7 +478,12 @@ def model(nodes, entry='_start'):
                     if m.identity not in extracted and demand:
                         include(m, reason='requires ' + ', '.join(sorted(demand)))
                 if len(extracted)==before: break
-            visits.append({'archive':node.token,'needed_on_arrival':arrival,'not_extracted':[m.identity for m in node.members if m.identity not in extracted]})
+            not_extracted = [m.identity for m in node.members if m.identity not in extracted]
+            # Identical visit records carry no evidence; group passes must
+            # not repeat them as noise.
+            if (node.token, tuple(arrival), tuple(not_extracted)) not in seen_visits:
+                seen_visits.add((node.token, tuple(arrival), tuple(not_extracted)))
+                visits.append({'archive':node.token,'needed_on_arrival':arrival,'not_extracted':not_extracted})
         elif node.kind == 'shared':
             m = node.members[0]
             if m.identity not in extracted and (not (as_needed or node.as_needed) or m.defines.intersection(needed)):
@@ -510,8 +523,8 @@ def diagnose(argv, verify=False, cwd=None):
         report['responses'] = response_receipts
         with tempfile.TemporaryDirectory(prefix='link-doctor-driver-') as directory:
             scratch = Path(directory)
-            args = template(argv[0], scratch)
-            report['discovery'] = {'driver':base.TOOLS[argv[0]],
+            args, tool_path = template(argv[0], scratch)
+            report['discovery'] = {'driver':tool_path,
                                    'argv':['-###','DOCTOR_INPUT.o','-o','DOCTOR_OUTPUT'],
                                    'linker_template':args,
                                    'plugin_policy':'trusted GCC liblto_plugin discovery only; never execute plugins; reject LTO/bitcode'}
@@ -606,7 +619,7 @@ def diagnose(argv, verify=False, cwd=None):
                     for s in m.defines: providers.setdefault(s,[]).append(m.identity)
                 for c in n.children: gather(c)
             for n in nodes: gather(n)
-            report['missed']=[{'symbol':s,'consumer':c,'provider':providers[s][0]} for s in original['unresolved'] if s in providers for c in original['consumers'][s]]
+            report['missed']=[{'symbol':s,'consumer':c,'provider':p} for s in original['unresolved'] if s in providers for c in original['consumers'][s] for p in providers[s]]
             user_providers = {}
             def user_units(n):
                 if n.path is not None and not n.runtime:
@@ -670,4 +683,11 @@ def diagnose(argv, verify=False, cwd=None):
     except (base.Rejected,base.ExecutionFailure,OSError,ValueError,IndexError) as exc:
         report.update(status='execution_failure' if isinstance(exc,(base.ExecutionFailure,OSError)) else 'unsupported',command=None,verified=False,reason=str(exc))
         if report['verification']['status']=='running': report['verification'].update(status='error',reason=str(exc))
+        return report
+    except Exception as exc:
+        # Fail closed: an unexpected internal error is still a report with
+        # the exception named, never a traceback and exit code 1.
+        if report['verification']['status']=='running': report['verification'].update(status='error',reason=str(exc))
+        report.update(status='execution_failure',command=None,verified=False,
+                      reason='unexpected internal error: ' + type(exc).__name__ + ': ' + str(exc))
         return report

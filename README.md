@@ -40,9 +40,9 @@ link-doctor --help
 link-doctor --version
 ```
 
-The test suite runs on CPython 3.11 and 3.14. Native checks use GCC/G++ 15.2
-and GNU binutils 2.46; hosted CI records its own toolchain versions. No
-Windows, macOS or non-GNU linker compatibility is claimed.
+The test suite runs on CPython 3.11 and 3.14 in hosted CI. Native checks use
+GCC/G++ 15.2 and GNU binutils 2.46; hosted CI records its own toolchain
+versions. No Windows, macOS or non-GNU linker compatibility is claimed.
 
 ## Quickstart
 
@@ -109,6 +109,11 @@ link-doctor diagnose --verify --json -- gcc @link.rsp
 Use the command from the actual failed link step. Compile-and-link commands,
 such as `gcc main.c -o app`, are not supported. The selected tools are trusted
 system executables, not wrappers found through the caller's `PATH`.
+
+C++ support follows the same narrow grammar: the g++ example above is a
+C-style link-only command. Real C++ (templates, `std::string`, inline
+functions) carries COMDAT section groups, which are rejected as out of
+scope, so only C-style C++ links diagnose.
 
 ### Command support
 

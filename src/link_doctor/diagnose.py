@@ -33,7 +33,9 @@ class ExecutionFailure(Exception):
 
 
 def native(tool, args, cwd):
-    path = Path(TOOLS[tool]).resolve()
+    # TOOLS keys name the fixed system tools; a full path is accepted so a
+    # resolved tool can be used without mutating module state.
+    path = Path(TOOLS.get(tool, tool)).resolve()
     try:
         mode = path.stat()
         if mode.st_uid != 0 or mode.st_mode & 0o022 or not stat.S_ISREG(mode.st_mode):
@@ -133,10 +135,15 @@ def archive_members(data: bytes, member_limit=MAX_MEMBERS):
         if len(header) != 60 or header[58:] != b"`\n":
             raise Rejected("malformed archive header")
         try:
-            size = int(header[48:58].decode("ascii").strip())
+            size_text = header[48:58].decode("ascii").strip()
             name = header[:16].decode("ascii").rstrip()
-        except (ValueError, UnicodeError) as exc:
+        except UnicodeError as exc:
             raise Rejected("malformed archive fields") from exc
+        # BFD parses strict ASCII decimal digits; Python int() would also
+        # accept "+12" and "1_0", silently parsing a different member size.
+        if not size_text.isdigit():
+            raise Rejected("malformed archive fields")
+        size = int(size_text)
         cursor += 60
         if size < 0 or cursor + size > len(data):
             raise Rejected("malformed archive member size")
@@ -207,7 +214,7 @@ def inspect_elf(path, identity, cwd):
     if not sections or sum(t == "SYMTAB" for _, t, *_ in sections) != 1:
         raise Rejected(f"require one ordinary symbol table: {identity}")
     for name, kind, addr, off, size, es, flags in sections:
-        if not set(flags) <= set("WAXMSI") or name.startswith((".init_array", ".fini_array", ".preinit_array")):
+        if not set(flags) <= set("WAXMSI"):
             raise Rejected(f"unsupported section semantics: {identity}: {name}")
     defines, requires = set(), set()
     weak_requires, weak_defines, commons, data_defines = set(), set(), set(), set()
@@ -401,4 +408,12 @@ def diagnose(argv, verify=False, cwd=None):
             report["verification"].update(status="error", reason=str(exc))
         status = "execution_failure" if isinstance(exc, (ExecutionFailure, OSError)) else "unsupported"
         report.update(status=status, command=None, verified=False, reason=str(exc))
+        return report
+    except Exception as exc:
+        # Fail closed: an unexpected internal error is still a report with
+        # the exception named, never a traceback and exit code 1.
+        if report["verification"]["status"] == "running":
+            report["verification"].update(status="error", reason=str(exc))
+        report.update(status="execution_failure", command=None, verified=False,
+                      reason=f"unexpected internal error: {type(exc).__name__}: {exc}")
         return report

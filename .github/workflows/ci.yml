@@ -11,14 +11,23 @@ name: ci
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   regression:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.14"
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f73544765e8e8df7f9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Record toolchain
         run: |
           python --version
@@ -33,8 +42,10 @@ jobs:
   package:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f73544765e8e8df7f9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
       - name: Record toolchain
@@ -47,7 +58,8 @@ jobs:
       - name: Build wheel and sdist
         run: |
           python -m venv /tmp/build-venv
-          /tmp/build-venv/bin/pip install --upgrade pip build
+          /tmp/build-venv/bin/pip install --upgrade pip
+          /tmp/build-venv/bin/pip install build==1.6.1
           /tmp/build-venv/bin/python -m build
       - name: Clean install, CLI surface and shipped examples outside the checkout
         run: |
